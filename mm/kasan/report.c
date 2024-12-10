@@ -48,6 +48,12 @@ enum kasan_arg_fault {
 	KASAN_ARG_FAULT_PANIC_ON_WRITE,
 };
 
+enum kasan_stack_type {
+	ACCESS_STACK,
+	ALLOC_STACK,
+	FREE_STACK,
+};
+
 static enum kasan_arg_fault kasan_arg_fault __ro_after_init = KASAN_ARG_FAULT_DEFAULT;
 
 /* kasan.fault=report/panic */
@@ -262,6 +268,90 @@ static void print_error_description(struct kasan_report_info *info)
 			info->access_addr, current->comm, task_pid_nr(current));
 }
 
+/* Helper to skip KASAN-related functions in stack-trace. */
+static int 
+get_stack_skipnr(unsigned long stack_entries[], int num_entries, enum kasan_stack_type type)
+{
+	char buf[64];
+	int len, skip, fallback;
+	
+	for (skip = 0; skip < num_entries; ++skip) {
+		len = scnprintf(buf, sizeof(buf), "%ps",
+				(void *)stack_entries[skip]);
+
+		/* Skip __kasan_* or kasan_* functions. */
+		if ((strnstr(buf, "kasan_", len) == buf) ||
+			(strnstr(buf, "__kasan_", len) == buf))
+			fallback = skip + 1;
+		
+		switch (type) {
+			/* Entry point to kasan report, exit if found. */
+			case ACCESS_STACK:
+				if (str_has_prefix(buf, "kasan_report"))
+					goto found;
+				break;
+
+			/* Entry point to slab allocators, exit if found. */
+			case ALLOC_STACK:
+				if (str_has_prefix(buf, "__kmalloc") ||
+					str_has_prefix(buf, "kmem_cache_alloc"))
+					goto found;
+				break;
+			
+			case FREE_STACK:
+				if (str_has_prefix(buf, "kfree") ||
+					str_has_prefix(buf, "kmem_cache_free"))
+					goto found;
+				break;
+		}		
+	}
+
+	if (fallback < num_entries)
+		return fallback;
+
+found:
+	skip++;
+	return skip < num_entries ? skip : 0;
+}
+
+/*
+ * Use in place of dump_stack() to filter out KASAN-related frames in
+ * the stack trace.
+ */
+static void kasan_dump_stack(void)
+{
+	unsigned long stack_entries[KASAN_STACK_DEPTH] = { 0 };
+
+	int num_stack_entries =
+		stack_trace_save(stack_entries, KASAN_STACK_DEPTH, 0);
+	int skipnr = get_stack_skipnr(stack_entries, num_stack_entries,
+									ACCESS_STACK);
+
+	dump_stack_print_info(KERN_ERR);
+	pr_err("Call Trace:\n");
+	stack_trace_print(stack_entries + skipnr, num_stack_entries - skipnr,
+			  0);
+}
+
+/*
+ * Use in place of stack_depot_print() to filter out KASAN-related frames
+ * in the stack trace.
+ */
+static void 
+kasan_stack_depot_print(depot_stack_handle_t stack, enum kasan_stack_type type)
+{
+	unsigned int nr_entries;
+	unsigned long *entries = NULL;
+	unsigned int skipnr;
+
+	nr_entries = stack_depot_fetch(stack, &entries);
+	if (nr_entries) {
+		skipnr = get_stack_skipnr(entries, nr_entries, 0, type);
+		stack_trace_print(entries + skipnr, nr_entries - skipnr, 0);
+	} else
+		pr_err("(stack is not available)\n");
+}
+
 static void print_track(struct kasan_track *track, const char *prefix)
 {
 #ifdef CONFIG_KASAN_EXTRA_INFO
@@ -277,9 +367,12 @@ static void print_track(struct kasan_track *track, const char *prefix)
 #else
 	pr_err("%s by task %u:\n", prefix, track->pid);
 #endif /* CONFIG_KASAN_EXTRA_INFO */
-	if (track->stack)
-		stack_depot_print(track->stack);
-	else
+	if (track->stack) {
+		if (strcmp(prefix, "Freed"))
+			kasan_stack_depot_print(track->stack, FREE_STACK);
+		else
+			kasan_stack_depot_print(track->stack, ALLOC_STACK);
+	} else
 		pr_err("(stack is not available)\n");
 }
 
@@ -375,7 +468,6 @@ static void print_address_description(void *addr, u8 tag,
 {
 	struct page *page = addr_to_page(addr);
 
-	dump_stack_lvl(KERN_ERR);
 	pr_err("\n");
 
 	if (info->cache && info->object) {
@@ -485,11 +577,11 @@ static void print_report(struct kasan_report_info *info)
 		kasan_print_tags(tag, info->first_bad_addr);
 	pr_err("\n");
 
+	kasan_dump_stack();
+
 	if (addr_has_metadata(addr)) {
 		print_address_description(addr, tag, info);
 		print_memory_metadata(info->first_bad_addr);
-	} else {
-		dump_stack_lvl(KERN_ERR);
 	}
 }
 
